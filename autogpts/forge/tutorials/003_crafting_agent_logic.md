@@ -264,7 +264,7 @@ Extracting clear messages from LLM outputs can be complex. Our method is simple 
 
 Abilities are the gears and levers that enable the agent to interact with tasks at hand. Let's unpack the mechanisms behind these abilities and how you can harness, and even extend, them.
 
-In the SDK, there's a `abilities` folder containing `registry.py`, `finish.py`, and a `file_system` subfolder. You can also add your own abilities here. `registry.py` is the main file for abilities. It contains the `@ability` decorator and the `AbilityRegister` class. This class actively tracks abilities and outlines their function. The base Agent class includes a default ability register available via `self.abilities`. It looks like this:
+In the SDK, there's an `actions` folder containing `registry.py`, `finish.py`, and a `file_system` subfolder. You can also add your own abilities here. `registry.py` is the main file for abilities. It contains the `@ability` decorator and the `AbilityRegister` class. This class actively tracks abilities and outlines their function. The base Agent class includes a default ability register available via `self.abilities`. It looks like this:
 
 ```python
 self.abilities = AbilityRegister(self)
