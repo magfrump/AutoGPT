@@ -1,7 +1,8 @@
 import abc
 import enum
+import math
 
-from pydantic import SecretBytes, SecretField, SecretStr
+from pydantic import BaseModel, SecretBytes, SecretField, SecretStr
 
 from autogpt.core.configuration import (
     SystemConfiguration,
@@ -25,19 +26,26 @@ class ProviderUsage(SystemConfiguration, abc.ABC):
 
 
 class ProviderBudget(SystemConfiguration):
-    total_budget: float = UserConfigurable()
-    total_cost: float
-    remaining_budget: float
+    total_budget: float = UserConfigurable(math.inf)
+    total_cost: float = 0
+    remaining_budget: float = math.inf
     usage: ProviderUsage
 
     @abc.abstractmethod
-    def update_usage_and_cost(self, *args, **kwargs) -> None:
-        """Update the usage and cost of the resource."""
+    def update_usage_and_cost(self, *args, **kwargs) -> float:
+        """Update the usage and cost of the provider.
+
+        Returns:
+            float: The (calculated) cost of the given model response.
+        """
         ...
 
 
 class ProviderCredentials(SystemConfiguration):
     """Struct for credentials."""
+
+    def unmasked(self) -> dict:
+        return unmask(self)
 
     class Config:
         json_encoders = {
@@ -45,6 +53,17 @@ class ProviderCredentials(SystemConfiguration):
             SecretBytes: lambda v: v.get_secret_value() if v else None,
             SecretField: lambda v: v.get_secret_value() if v else None,
         }
+
+
+def unmask(model: BaseModel):
+    unmasked_fields = {}
+    for field_name, _ in model.__fields__.items():
+        value = getattr(model, field_name)
+        if isinstance(value, SecretStr):
+            unmasked_fields[field_name] = value.get_secret_value()
+        else:
+            unmasked_fields[field_name] = value
+    return unmasked_fields
 
 
 class ProviderSettings(SystemSettings):

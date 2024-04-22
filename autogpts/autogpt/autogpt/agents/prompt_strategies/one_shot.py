@@ -4,15 +4,10 @@ import json
 import platform
 import re
 from logging import Logger
-from typing import TYPE_CHECKING, Callable, Optional
 
 import distro
 
-if TYPE_CHECKING:
-    from autogpt.agents.agent import Agent
-    from autogpt.models.action_history import Episode
-
-from autogpt.agents.utils.exceptions import InvalidAgentResponseError
+from autogpt.agents.base import ThoughtProcessOutput
 from autogpt.config import AIDirectives, AIProfile
 from autogpt.core.configuration.schema import SystemConfiguration, UserConfigurable
 from autogpt.core.prompting import (
@@ -21,13 +16,14 @@ from autogpt.core.prompting import (
     PromptStrategy,
 )
 from autogpt.core.resource.model_providers.schema import (
-    AssistantChatMessageDict,
+    AssistantChatMessage,
     ChatMessage,
     CompletionModelFunction,
 )
 from autogpt.core.utils.json_schema import JSONSchema
-from autogpt.json_utils.utilities import extract_dict_from_response
-from autogpt.prompts.utils import format_numbered_list, indent
+from autogpt.core.utils.json_utils import extract_dict_from_json
+from autogpt.prompts.utils import format_numbered_list
+from autogpt.utils.exceptions import InvalidAgentResponseError
 
 
 class OneShotAgentPromptConfiguration(SystemConfiguration):
@@ -153,68 +149,39 @@ class OneShotAgentPromptStrategy(PromptStrategy):
     def build_prompt(
         self,
         *,
+        messages: list[ChatMessage],
         task: str,
         ai_profile: AIProfile,
         ai_directives: AIDirectives,
         commands: list[CompletionModelFunction],
-        event_history: list[Episode],
         include_os_info: bool,
-        max_prompt_tokens: int,
-        count_tokens: Callable[[str], int],
-        count_message_tokens: Callable[[ChatMessage | list[ChatMessage]], int],
-        extra_messages: Optional[list[ChatMessage]] = None,
         **extras,
     ) -> ChatPrompt:
         """Constructs and returns a prompt with the following structure:
         1. System prompt
-        2. Message history of the agent, truncated & prepended with running summary
-            as needed
         3. `cycle_instruction`
         """
-        if not extra_messages:
-            extra_messages = []
-
         system_prompt = self.build_system_prompt(
             ai_profile=ai_profile,
             ai_directives=ai_directives,
             commands=commands,
             include_os_info=include_os_info,
         )
-        system_prompt_tlength = count_message_tokens(ChatMessage.system(system_prompt))
 
         user_task = f'"""{task}"""'
-        user_task_tlength = count_message_tokens(ChatMessage.user(user_task))
 
         response_format_instr = self.response_format_instruction(
             self.config.use_functions_api
         )
-        extra_messages.append(ChatMessage.system(response_format_instr))
+        messages.append(ChatMessage.system(response_format_instr))
 
         final_instruction_msg = ChatMessage.user(self.config.choose_action_instruction)
-        final_instruction_tlength = count_message_tokens(final_instruction_msg)
-
-        if event_history:
-            progress = self.compile_progress(
-                event_history,
-                count_tokens=count_tokens,
-                max_tokens=(
-                    max_prompt_tokens
-                    - system_prompt_tlength
-                    - user_task_tlength
-                    - final_instruction_tlength
-                    - count_message_tokens(extra_messages)
-                ),
-            )
-            extra_messages.insert(
-                0,
-                ChatMessage.system(f"## Progress\n\n{progress}"),
-            )
 
         prompt = ChatPrompt(
             messages=[
                 ChatMessage.system(system_prompt),
                 ChatMessage.user(user_task),
-                *extra_messages,
+                *messages,
                 final_instruction_msg,
             ],
         )
@@ -252,51 +219,6 @@ class OneShotAgentPromptStrategy(PromptStrategy):
 
         # Join non-empty parts together into paragraph format
         return "\n\n".join(filter(None, system_prompt_parts)).strip("\n")
-
-    def compile_progress(
-        self,
-        episode_history: list[Episode],
-        max_tokens: Optional[int] = None,
-        count_tokens: Optional[Callable[[str], int]] = None,
-    ) -> str:
-        if max_tokens and not count_tokens:
-            raise ValueError("count_tokens is required if max_tokens is set")
-
-        steps: list[str] = []
-        tokens: int = 0
-        # start: int = len(episode_history)
-
-        for i, c in reversed(list(enumerate(episode_history))):
-            step = f"### Step {i+1}: Executed `{c.action.format_call()}`\n"
-            step += f'- **Reasoning:** "{c.action.reasoning}"\n'
-            step += (
-                f"- **Status:** `{c.result.status if c.result else 'did_not_finish'}`\n"
-            )
-            if c.result:
-                if c.result.status == "success":
-                    result = str(c.result)
-                    result = "\n" + indent(result) if "\n" in result else result
-                    step += f"- **Output:** {result}"
-                elif c.result.status == "error":
-                    step += f"- **Reason:** {c.result.reason}\n"
-                    if c.result.error:
-                        step += f"- **Error:** {c.result.error}\n"
-                elif c.result.status == "interrupted_by_human":
-                    step += f"- **Feedback:** {c.result.feedback}\n"
-
-            if max_tokens and count_tokens:
-                step_tokens = count_tokens(step)
-                if tokens + step_tokens > max_tokens:
-                    break
-                tokens += step_tokens
-
-            steps.insert(0, step)
-        #     start = i
-
-        # # TODO: summarize remaining
-        # part = slice(0, start)
-
-        return "\n\n".join(steps)
 
     def response_format_instruction(self, use_functions_api: bool) -> str:
         response_schema = self.response_schema.copy(deep=True)
@@ -386,17 +308,26 @@ class OneShotAgentPromptStrategy(PromptStrategy):
 
     def parse_response_content(
         self,
-        response: AssistantChatMessageDict,
-    ) -> Agent.ThoughtProcessOutput:
-        if "content" not in response:
+        response: AssistantChatMessage,
+    ) -> ThoughtProcessOutput:
+        if not response.content:
             raise InvalidAgentResponseError("Assistant response has no text content")
 
-        assistant_reply_dict = extract_dict_from_response(response["content"])
-
-        _, errors = self.response_schema.validate_object(
-            object=assistant_reply_dict,
-            logger=self.logger,
+        self.logger.debug(
+            "LLM response content:"
+            + (
+                f"\n{response.content}"
+                if "\n" in response.content
+                else f" '{response.content}'"
+            )
         )
+        assistant_reply_dict = extract_dict_from_json(response.content)
+        self.logger.debug(
+            "Validating object extracted from LLM response:\n"
+            f"{json.dumps(assistant_reply_dict, indent=4)}"
+        )
+
+        _, errors = self.response_schema.validate_object(assistant_reply_dict)
         if errors:
             raise InvalidAgentResponseError(
                 "Validation of response failed:\n  "
@@ -407,7 +338,11 @@ class OneShotAgentPromptStrategy(PromptStrategy):
         command_name, arguments = extract_command(
             assistant_reply_dict, response, self.config.use_functions_api
         )
-        return command_name, arguments, assistant_reply_dict
+        return ThoughtProcessOutput(
+            command_name=command_name,
+            command_args=arguments,
+            thoughts=assistant_reply_dict,
+        )
 
 
 #############
@@ -417,14 +352,14 @@ class OneShotAgentPromptStrategy(PromptStrategy):
 
 def extract_command(
     assistant_reply_json: dict,
-    assistant_reply: AssistantChatMessageDict,
+    assistant_reply: AssistantChatMessage,
     use_openai_functions_api: bool,
 ) -> tuple[str, dict[str, str]]:
     """Parse the response and return the command name and arguments
 
     Args:
         assistant_reply_json (dict): The response object from the AI
-        assistant_reply (ChatModelResponse): The model response from the AI
+        assistant_reply (AssistantChatMessage): The model response from the AI
         config (Config): The config object
 
     Returns:
@@ -436,13 +371,11 @@ def extract_command(
         Exception: If any other error occurs
     """
     if use_openai_functions_api:
-        if not assistant_reply.get("tool_calls"):
+        if not assistant_reply.tool_calls:
             raise InvalidAgentResponseError("No 'tool_calls' in assistant reply")
         assistant_reply_json["command"] = {
-            "name": assistant_reply["tool_calls"][0]["function"]["name"],
-            "args": json.loads(
-                assistant_reply["tool_calls"][0]["function"]["arguments"]
-            ),
+            "name": assistant_reply.tool_calls[0].function.name,
+            "args": assistant_reply.tool_calls[0].function.arguments,
         }
     try:
         if not isinstance(assistant_reply_json, dict):
